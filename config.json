@@ -1,0 +1,15 @@
+{
+  "ip_addresses": ["192.168.1.100", "", "", ""],
+  "username": "cloud_username",
+  "password": "cloud_password",
+  "download_directory": "recordings/",
+  "max_days": 30,
+  "timezone": "Australia/Sydney",
+  "timeout_minutes": 55,
+  "regenerate_thumbnails": false,
+  "force_regenerate_thumbnails": false,
+  "thumbnail_height": 100,
+  "thumbnail_time_percentage": 0.1,
+  "thumbnail_quality": 2,
+  "max_retries": 3
+}

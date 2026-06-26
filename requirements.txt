@@ -1,0 +1,13 @@
+# Core dependencies for tapo-downloader
+pytapo==3.4.15
+aiohttp>=3.10.0
+psutil>=5.9.0
+pytz>=2024.1
+nest-asyncio>=1.6.0
+
+# Critical for Tapo TLS handshake issues (self-signed certs + weak ciphers)
+urllib3<2
+requests>=2.32.0
+
+# Optional but recommended for better compatibility
+certifi>=2024.0.0
