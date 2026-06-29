@@ -14,8 +14,18 @@ import asyncio
 from functools import wraps
 from typing import Dict, List, Optional, Callable
 from pytapo import Tapo
-from pytapo.media_stream.downloader import Downloader
-from pytapo.media_stream.convert import Convert
+# ── Local patches ──────────────────────────────────────────────────────────────
+# tapo_patches.py lives alongside this script and extends the installed pytapo
+# library without modifying it.  Upgrading pytapo (pip install -U pytapo) will
+# never overwrite these customisations.
+#
+# What the patches add / change vs the upstream library:
+#   Convert           – generate_thumbnail() method (monkey-patched onto the class)
+#   CustomDownloader  – predefined filename format, thumbnail calls after save,
+#                       short-segment skip (< 3 s), overwriteFiles flag,
+#                       direct timeCorrection usage
+from tapo_patches import CustomDownloader as Downloader, Convert
+# ──────────────────────────────────────────────────────────────────────────────
 import urllib3
 import ssl
 import requests
@@ -299,7 +309,7 @@ async def process_recording(
             minutes = duration_seconds // 60
             seconds = duration_seconds % 60
             duration_str = f"{minutes}m-{seconds}s"
-            filename = f"{local_dt.strftime('%Y-%m-%d_%H-%M')}_{duration_str}.mp4"
+            filename = f"{local_dt.strftime('%Y-%m-%d_%H-%M-%S')}_{duration_str}.mp4"
             logger.info("Camera %s: Generated filename %s for timestamp %s", ip_address, filename, start_time_rec)
         except (ValueError, TypeError) as e:
             logger.error("Camera %s: Failed to process timestamp %s: %s", ip_address, start_time_rec, str(e))
