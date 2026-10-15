@@ -35,6 +35,30 @@ urllib3.util.ssl_.DEFAULT_CIPHERS = 'ALL:@SECLEVEL=1'
 
 nest_asyncio.apply()
 
+""" Detection types (filename suffix)
+Sourced from the camera's searchDetectionList alarm_type codes; not all
+codes apply to every model/firmware. See DETECTION_TYPE_NAMES below.
+
+motion:             Standard pixel-change motion detection.
+person:             A person has been identified.
+pet:                A pet (such as a dog or cat) has been spotted.
+vehicle:            A car, truck, or moving vehicle was found.
+baby_cry:           Audio detection picking up an infant crying.
+bark / meow:        Audio detection of a dog barking / cat meowing.
+line_crossing:      Something crossed a pre-configured electronic tripwire.
+area_intrusion:     Something entered a defined detection zone.
+tamper:             The camera lens was physically covered or blocked.
+glass_break:        Audio detection of breaking glass.
+smoke:              Smoke detected.
+face:               A face was recognized.
+loitering:          Prolonged presence detected in view.
+package_delivered:  A package was placed in view.
+package_picked_up:  A package was removed from view.
+
+Unmapped codes fall back to "type_<n>" so new/unknown codes are still
+visible in filenames rather than silently mislabeled.
+"""
+
 # Constants
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".tapo-downloader")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -270,6 +294,58 @@ async def get_recording_days(tapo: Tapo, ip_address: str, output_dir: str, compl
 
     return sorted(recording_days, reverse=True)
 
+# Numeric alarm_type codes returned by the camera's searchDetectionList API.
+# Sourced from community reverse-engineering (e.g. iobroker.tapo); not all
+# codes apply to every model/firmware.
+DETECTION_TYPE_NAMES = {
+    2: "motion",
+    3: "tamper",
+    4: "line_crossing",
+    5: "area_intrusion",
+    6: "person",
+    7: "baby_cry",
+    8: "vehicle",
+    9: "pet",
+    11: "bark",
+    12: "meow",
+    13: "glass_break",
+    14: "smoke",
+    15: "package_delivered",
+    16: "package_picked_up",
+    20: "face",
+    32: "loitering",
+}
+
+
+def find_event_type(events: List[Dict], rec_start: int, rec_end: int) -> str:
+    """Match a recording's time range against fetched detection events to find
+    what triggered it (e.g. motion vs person). Falls back to 'motion' if no
+    overlapping event is found or the events list is empty."""
+    for ev in events:
+        ev_start = ev.get("start_time")
+        ev_end = ev.get("end_time")
+        if ev_start is None or ev_end is None:
+            continue
+        # Overlapping time ranges
+        if ev_start <= rec_end and ev_end >= rec_start:
+            raw_type = (
+                ev.get("type")
+                or ev.get("detect_type")
+                or ev.get("alarm_type")
+                or ev.get("event_type")
+                or ev.get("class")
+            )
+            if raw_type is not None:
+                # Numeric codes get mapped to a readable name; unknown codes
+                # fall back to "type_<code>" so they're still distinguishable.
+                try:
+                    code = int(raw_type)
+                    return DETECTION_TYPE_NAMES.get(code, f"type_{code}")
+                except (ValueError, TypeError):
+                    return str(raw_type).strip().lower().replace(" ", "_").replace("-", "_")
+    return "motion"
+
+
 async def process_recording(
     tapo: Tapo,
     recording: Dict,
@@ -278,9 +354,11 @@ async def process_recording(
     output_dir: str,
     ip_address: str,
     start_time: float,
-    idx: int
+    idx: int,
+    day_events: Optional[List[Dict]] = None
 ) -> bool:
     logger.info("Camera %s: Processing recording %d for date %s", ip_address, idx + 1, date)
+    
     for key, value in recording.items():
         start_time_rec = value.get("startTime")
         end_time = value.get("endTime")
@@ -300,7 +378,15 @@ async def process_recording(
                            ip_address, key, date, start_time_rec, end_time)
             continue
 
-        logger.info("Camera %s: Processing recording: start=%s, end=%s", ip_address, start_time_rec, end_time)
+        # ── EXTRACT EVENT TYPE ──────────────────────────────────────────────────
+        # NOTE: getRecordings() (searchVideoOfDay) does NOT return alarm_type/type
+        # fields - that data only exists in the camera's detection-event API.
+        # We match this recording's time range against day_events (fetched once
+        # per day via tapo.getEvents()) to find what actually triggered it.
+        event_suffix = find_event_type(day_events or [], start_time_rec, end_time)
+        # ────────────────────────────────────────────────────────────────────────
+
+        logger.info("Camera %s: Processing recording: start=%s, end=%s, event=%s", ip_address, start_time_rec, end_time, event_suffix)
         try:
             utc_dt = datetime.utcfromtimestamp(start_time_rec).replace(tzinfo=pytz.UTC)
             local_dt = utc_dt.astimezone(timezone)
@@ -309,12 +395,14 @@ async def process_recording(
             minutes = duration_seconds // 60
             seconds = duration_seconds % 60
             duration_str = f"{minutes}m-{seconds}s"
-            filename = f"{local_dt.strftime('%Y-%m-%d_%H-%M-%S')}_{duration_str}.mp4"
+            
+            # Appended event_suffix to the end of the filename before extension
+            filename = f"{local_dt.strftime('%Y-%m-%d_%H-%M-%S')}_{duration_str}_{event_suffix}.mp4"
             logger.info("Camera %s: Generated filename %s for timestamp %s", ip_address, filename, start_time_rec)
         except (ValueError, TypeError) as e:
             logger.error("Camera %s: Failed to process timestamp %s: %s", ip_address, start_time_rec, str(e))
             day_dir_name = "unknown"
-            filename = f"recording_{idx+1}.mp4"
+            filename = f"recording_{idx+1}_{event_suffix}.mp4"
 
         recording_dir = os.path.join(output_dir, day_dir_name)
         os.makedirs(recording_dir, exist_ok=True)
@@ -347,7 +435,6 @@ async def process_recording(
 
         logger.info("Camera %s: Initiating download for recording %s to %s", ip_address, key, video_path)
         try:
-            # Use freshness_seconds if non-zero, otherwise use camera-provided time_correction
             effective_time_correction = freshness_seconds if freshness_seconds > 0 else time_correction
             downloader = Downloader(
                 tapo,
@@ -391,6 +478,32 @@ async def process_recording(
                 logger.info("Camera %s: Removed partial file %s", ip_address, actual_file)
     return False
 
+
+@handle_exceptions("get_day_events")
+async def get_day_events(tapo: Tapo, date: str, ip_address: str) -> List[Dict]:
+    """Fetch detection events (motion/person/etc) for an entire day so they
+    can be matched against recording segments by time overlap."""
+    try:
+        day = datetime.strptime(date, "%Y%m%d")
+        local_start = timezone.localize(day)
+        local_end = timezone.localize(day + timedelta(hours=23, minutes=59, seconds=59))
+        start_ts = int(local_start.astimezone(pytz.UTC).timestamp())
+        end_ts = int(local_end.astimezone(pytz.UTC).timestamp())
+
+        try:
+            events = await tapo.getEvents(start_ts, end_ts)
+        except TypeError:
+            events = tapo.getEvents(start_ts, end_ts)
+
+        if events:
+            logger.debug("Camera %s: Sample raw event dict for %s: %s", ip_address, date, events[0])
+        logger.info("Camera %s: Fetched %d detection events for %s", ip_address, len(events) if events else 0, date)
+        return events or []
+    except Exception as e:
+        logger.error("Camera %s: Failed to fetch detection events for %s: %s", ip_address, date, str(e))
+        return []
+
+
 @handle_exceptions("download_recordings_for_day")
 async def download_recordings_for_day(
     tapo: Tapo,
@@ -426,7 +539,12 @@ async def download_recordings_for_day(
             logger.warning("Camera %s: No recordings found for %s", ip_address, date)
             return False
 
+        # If recordings data returns directly as a dictionary instead of a list of chunks, format it into a loopable list
+        if isinstance(recordings, dict):
+            recordings = [recordings]
+
         logger.info("Camera %s: Found %d recordings for %s", ip_address, len(recordings), date)
+        day_events = await get_day_events(tapo, date, ip_address)
         for idx, recording in enumerate(recordings):
             elapsed_seconds = time.time() - start_time
             if elapsed_seconds > timeout_seconds:
@@ -436,7 +554,7 @@ async def download_recordings_for_day(
 
             logger.debug("Camera %s: Processing recording %d: %s", ip_address, idx + 1, recording)
             try:
-                await process_recording(tapo, recording, date, time_correction, output_dir, ip_address, start_time, idx)
+                await process_recording(tapo, recording, date, time_correction, output_dir, ip_address, start_time, idx, day_events)
             except Exception as e:
                 logger.error("Camera %s: Failed to process recording %d for %s: %s", ip_address, idx + 1, date, str(e))
 
@@ -450,6 +568,7 @@ async def download_recordings_for_day(
     except ValueError as e:
         logger.error("Camera %s: Invalid date format for %s: %s", ip_address, date, str(e))
         return False
+
 
 @handle_exceptions("regenerate_missing_thumbnails")
 async def regenerate_missing_thumbnails(output_dir: str, camera_number: int, video_files: List[str]) -> int:
