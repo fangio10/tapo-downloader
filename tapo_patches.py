@@ -1,30 +1,40 @@
 """
 tapo_patches.py
 ---------------
-Extends pytapo's Convert and Downloader classes with local customisations
-so that upgrading the pytapo library never overwrites these changes.
+Local customisations on top of pytapo, kept thin so that upgrading pytapo
+(pip install -U pytapo) keeps working. The download logic itself (the fast
+"download" request the Tapo app uses, stall timeouts, camera-busy handling,
+retry and fall-back to real-time playback) comes from pytapo's own Downloader;
+this file only adds:
 
-Customisations applied:
   Convert
     - generate_thumbnail() method added via monkey-patch
 
   CustomDownloader (subclass of pytapo Downloader)
-    - Predefined filename format  (<date>_<HH-MM>_<Xm-Ys>.mp4)
-    - Thumbnail generation after every successful save
-    - Short-segment skip  (< 3 s)
-    - Respects overwriteFiles flag
-    - Uses timeCorrection directly (no FRESH_RECORDING_TIME_SECONDS offset)
-    - Accepts thumbnail_* and max_retries kwargs
+    - download_method: "download" (about 10x real time, what the Tapo app uses)
+      or "playback" (real time). Needs a pytapo with the `method` option; on an
+      older pytapo it is ignored and playback is used.
+    - FRESH_RECORDING_TIME_SECONDS = 0: a clip counts as finished as soon as the
+      camera's own clock passes its end time (pytapo's default adds 60 s)
+    - segments shorter than 3 s are skipped
+    - the clip is written to <day folder>/.partial/ and moved into place only
+      once complete, so a run that is killed mid-save never leaves a truncated
+      file under its final name (the downloader treats existing files as done)
+    - a thumbnail is generated after every successful save; a thumbnail problem
+      is reported but never discards the clip
 """
 
 import asyncio
-import json
+import inspect
+import logging
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pytapo.media_stream.convert import Convert
 from pytapo.media_stream.downloader import Downloader
+
+log = logging.getLogger("tapo_patches")
 
 
 # ---------------------------------------------------------------------------
@@ -100,32 +110,34 @@ Convert.generate_thumbnail = _generate_thumbnail
 # ---------------------------------------------------------------------------
 
 class CustomDownloader(Downloader):
-    """
-    Drop-in replacement for pytapo's Downloader that adds:
-      - Predefined filename derived from the recording's local timestamp
-      - Thumbnail generation after save
-      - Short-segment (< 3 s) skipping
-      - overwriteFiles support
-      - Direct timeCorrection usage (no FRESH_RECORDING_TIME_SECONDS offset)
+    """Drop-in replacement for pytapo's Downloader (see the module docstring).
 
-    Extra constructor kwargs (all optional, ignored by parent):
-      thumbnail_height           int    default 100
-      thumbnail_time_percentage  float  default 0.1
-      thumbnail_quality          int    default 2
-      force_regenerate_thumbnails bool  default False
-      max_retries                int    default 3
+    Extra constructor kwargs (all optional):
+      thumbnail_height            int    default 100
+      thumbnail_time_percentage   float  default 0.1
+      thumbnail_quality           int    default 2
+      force_regenerate_thumbnails bool   default False
+      max_retries                 int    thumbnail retries, default 3
+      download_method             str    "download" (default) or "playback"
     """
+
+    FRESH_RECORDING_TIME_SECONDS = 0
 
     def __init__(self, tapo, start_time, end_time, time_correction,
                  outputDirectory="./", fileName=None, overwriteFiles=False,
                  window_size=None, padding=None,
-                 # thumbnail / retry kwargs consumed here, not passed to super
                  thumbnail_height=100,
                  thumbnail_time_percentage=0.1,
                  thumbnail_quality=2,
                  force_regenerate_thumbnails=False,
                  max_retries=3,
+                 download_method="download",
                  **kwargs):
+
+        if "method" in inspect.signature(Downloader.__init__).parameters:
+            kwargs["method"] = download_method
+        elif download_method == "download":
+            log.warning("This pytapo has no fast download method (pip install -U pytapo); using real-time playback.")
 
         super().__init__(
             tapo=tapo,
@@ -145,173 +157,84 @@ class CustomDownloader(Downloader):
         self.force_regenerate_thumbnails = force_regenerate_thumbnails
         self.max_retries = max_retries
 
-    def _thumbnail_path(self, video_path):
+    @staticmethod
+    def _thumbnail_path(video_path):
         return os.path.join(
             os.path.dirname(video_path),
             "thumbnails",
             os.path.splitext(os.path.basename(video_path))[0] + ".jpg",
         )
 
-    async def _maybe_generate_thumbnail(self, convert, video_path):
-        """Yield status dicts and generate (or skip) the thumbnail."""
-        thumbnail_path = self._thumbnail_path(video_path)
-        if self.force_regenerate_thumbnails or not os.path.exists(thumbnail_path):
-            yield {"currentAction": "Generating thumbnail", "fileName": video_path,
+    @staticmethod
+    def _remove_partials(partial_dir, name):
+        """Delete leftovers of an interrupted run (the clip and pytapo's .ts / audio temp files)."""
+        try:
+            for entry in os.listdir(partial_dir):
+                if entry == name or entry.startswith(name + "."):
+                    os.remove(os.path.join(partial_dir, entry))
+        except OSError:
+            pass
+
+    async def download(self, retry=False):
+        segment_length = self.endTime - self.startTime
+        final_dir = self.outputDirectory
+        if self.fileName is None:
+            start = datetime.fromtimestamp(int(self.startTime), timezone.utc).strftime("%Y-%m-%d %H_%M_%S")
+            end = datetime.fromtimestamp(int(self.endTime), timezone.utc).strftime("%Y-%m-%d %H_%M_%S")
+            self.fileName = f"{start}-{end}.mp4"
+        name = self.fileName
+        final_path = os.path.join(final_dir, name)
+
+        if segment_length < 3:
+            yield {"currentAction": "Skipping (duration too short)", "fileName": final_path,
                    "progress": 0, "total": 0}
-            await convert.generate_thumbnail(
-                video_path,
-                thumbnail_path,
-                height=self.thumbnail_height,
-                time_percentage=self.thumbnail_time_percentage,
-                quality=self.thumbnail_quality,
-                max_retries=self.max_retries,
-            )
-        else:
-            yield {"currentAction": "Skipping thumbnail generation (exists)",
-                   "fileName": video_path, "progress": 0, "total": 0}
+            return
+        if os.path.isfile(final_path) and not self.overwriteFiles:
+            yield {"currentAction": "Skipping", "fileName": final_path, "progress": 0, "total": 0}
+            return
 
-    async def download(self, retry=False):  # noqa: C901  (complexity is inherited)
-        downloading = True
-        while downloading:
-            dateStart = datetime.utcfromtimestamp(int(self.startTime)).strftime(
-                "%Y-%m-%d %H_%M_%S"
-            )
-            dateEnd = datetime.utcfromtimestamp(int(self.endTime)).strftime(
-                "%Y-%m-%d %H_%M_%S"
-            )
-            segmentLength = self.endTime - self.startTime
+        partial_dir = os.path.join(final_dir, ".partial")
+        partial_path = os.path.join(partial_dir, name)
+        os.makedirs(partial_dir, exist_ok=True)
+        self._remove_partials(partial_dir, name)
+        self.outputDirectory = partial_dir + os.sep   # pytapo writes <outputDirectory><fileName>
+        self.overwriteFiles = True                    # the partial name is ours; the final-name check was done above
+        saved = False
+        try:
+            async for status in super().download(retry):
+                out = dict(status)
+                if out.get("fileName") == partial_path:
+                    out["fileName"] = final_path
+                yield out
 
-            # ── short-segment skip ──────────────────────────────────────────
-            if segmentLength < 3:
-                fileName = (
-                    self.outputDirectory + str(dateStart) + "-" + dateEnd + ".mp4"
-                    if self.fileName is None
-                    else os.path.join(self.outputDirectory, self.fileName)
-                )
-                yield {"currentAction": "Skipping (duration too short)",
-                       "fileName": fileName, "progress": 0, "total": 0}
-                return
+            if os.path.isfile(partial_path):
+                os.replace(partial_path, final_path)   # atomic: the clip appears complete or not at all
+                saved = True
+        finally:
+            self.outputDirectory = final_dir
+            self._remove_partials(partial_dir, name)
+            try:
+                os.rmdir(partial_dir)   # only succeeds when empty
+            except OSError:
+                pass
 
-            # ── resolve filename ────────────────────────────────────────────
-            if self.fileName is None:
-                fileName = self.outputDirectory + str(dateStart) + "-" + dateEnd + ".mp4"
+        if saved:
+            thumbnail_path = self._thumbnail_path(final_path)
+            if self.force_regenerate_thumbnails or not os.path.exists(thumbnail_path):
+                yield {"currentAction": "Generating thumbnail", "fileName": final_path, "progress": 0, "total": 0}
+                try:
+                    await Convert().generate_thumbnail(
+                        final_path,
+                        thumbnail_path,
+                        height=self.thumbnail_height,
+                        time_percentage=self.thumbnail_time_percentage,
+                        quality=self.thumbnail_quality,
+                        max_retries=self.max_retries,
+                    )
+                except Exception as e:
+                    # The clip is safely saved; a missing thumbnail is reported by the caller and can be rebuilt later.
+                    log.warning("Thumbnail for %s failed: %s", final_path, e)
+                    yield {"currentAction": "Thumbnail failed", "fileName": final_path, "progress": 0, "total": 0}
             else:
-                fileName = os.path.join(self.outputDirectory, self.fileName)
-
-            thumbnailName = self._thumbnail_path(fileName)
-
-            # ── still recording? ────────────────────────────────────────────
-            if datetime.now().timestamp() - self.timeCorrection < self.endTime:
-                yield {"currentAction": "Recording in progress",
-                       "fileName": fileName, "progress": 0, "total": 0}
-                downloading = False
-
-            # ── already on disk ─────────────────────────────────────────────
-            elif os.path.isfile(fileName) and not self.overwriteFiles:
-                yield {"currentAction": "Skipping",
-                       "fileName": fileName, "progress": 0, "total": 0}
-                downloading = False
-
-            # ── actually download ────────────────────────────────────────────
-            else:
-                from pytapo.media_stream._utils import StreamType
-
-                convert = Convert()
-                if self.audio_sample_rate is None:
-                    self.audio_sample_rate = await self._get_audio_sample_rate()
-
-                mediaSession = self.tapo.getMediaSession(StreamType.Download)
-                if retry:
-                    mediaSession.set_window_size(50)
-                else:
-                    mediaSession.set_window_size(self.window_size)
-
-                async with mediaSession:
-                    payload = json.dumps({
-                        "type": "request",
-                        "seq": 1,
-                        "params": {
-                            "playback": {
-                                "client_id": self.tapo.getUserID(),
-                                "channels": [0, 1],
-                                "scale": "1/1",
-                                "start_time": str(self.startTime),
-                                "end_time": str(self.endTime),
-                                "event_type": [1, 2],
-                            },
-                            "method": "get",
-                        },
-                    })
-
-                    dataChunks = 0
-                    currentAction = "Retrying" if retry else "Downloading"
-                    downloadedFull = False
-
-                    async for resp in mediaSession.transceive(payload):
-                        if resp.mimetype == "video/mp2t":
-                            dataChunks += 1
-                            convert.write(
-                                resp.plaintext,
-                                resp.audioPayload,
-                                resp.audioPayloadType,
-                                self.audio_sample_rate,
-                            )
-                            detectedLength = convert.getLength()
-                            if detectedLength is False:
-                                yield {"currentAction": currentAction, "fileName": fileName,
-                                       "progress": 0, "total": segmentLength}
-                                detectedLength = 0
-                            else:
-                                yield {"currentAction": currentAction, "fileName": fileName,
-                                       "progress": detectedLength, "total": segmentLength}
-
-                            if (detectedLength > segmentLength + self.padding) or (
-                                retry and detectedLength >= segmentLength
-                            ):
-                                downloadedFull = True
-                                yield {"currentAction": "Converting", "fileName": fileName,
-                                       "progress": 0, "total": 0}
-                                await convert.save(fileName, segmentLength)
-                                async for s in self._maybe_generate_thumbnail(convert, fileName):
-                                    yield s
-                                downloading = False
-                                break
-
-                        elif resp.mimetype == "application/json":
-                            try:
-                                json_data = json.loads(resp.plaintext.decode())
-                                if (
-                                    "type" in json_data
-                                    and json_data["type"] == "notification"
-                                    and json_data.get("params", {}).get("event_type") == "stream_status"
-                                    and json_data["params"].get("status") == "finished"
-                                ):
-                                    downloadedFull = True
-                                    yield {"currentAction": "Converting", "fileName": fileName,
-                                           "progress": 0, "total": 0}
-                                    await convert.save(fileName, convert.getLength())
-                                    async for s in self._maybe_generate_thumbnail(convert, fileName):
-                                        yield s
-                                    downloading = False
-                                    break
-                            except json.JSONDecodeError:
-                                self.tapo.logger.debugLog("Unable to parse JSON sent from device")
-
-                    if downloading:
-                        if not downloadedFull and not retry:
-                            yield {"currentAction": "Retrying", "fileName": fileName,
-                                   "progress": 0, "total": 0}
-                            retry = True
-                        else:
-                            detectedLength = convert.getLength()
-                            if detectedLength >= segmentLength - 5:
-                                downloadedFull = True
-                                yield {"currentAction": "Converting [shorter]",
-                                       "fileName": fileName, "progress": 0, "total": 0}
-                                await convert.save(fileName, segmentLength)
-                                async for s in self._maybe_generate_thumbnail(convert, fileName):
-                                    yield s
-                            else:
-                                yield {"currentAction": "Giving up", "fileName": fileName,
-                                       "progress": 0, "total": 0}
-                            downloading = False
+                yield {"currentAction": "Skipping thumbnail generation (exists)", "fileName": final_path,
+                       "progress": 0, "total": 0}
