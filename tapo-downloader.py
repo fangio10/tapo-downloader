@@ -1,6 +1,7 @@
 import nest_asyncio
 import argparse
 import contextvars
+import copy
 import fcntl
 import inspect
 import logging
@@ -9,6 +10,7 @@ import psutil
 import glob
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -128,9 +130,11 @@ DEFAULT_CONFIG = {
     "thumbnail_time_percentage": 0.1,
     "thumbnail_quality": 2,
     "max_retries": 1,
+    "overwrite_files": False,      # re-download clips that already exist (normally leave off)
     "freshness_seconds": 0,  # User-defined override for timeCorrection
     "onvif_username": "",          # sweep/hybrid: camera account for ONVIF events (blank = use username/password)
     "onvif_password": "",
+    "download_method": "download", # download (fast, ~10x real time, what the Tapo app uses) | playback (real time)
     "mode": "cron",                # cron | sweep | hybrid | watch
     "watch_cameras": [],           # e.g. ["cam3", "cam4"]: cameras watched by polling instead of ONVIF events
     "watch_seconds": 60,           # watch: seconds between checks
@@ -164,6 +168,27 @@ def _type_name(expected_type) -> str:
         return " or ".join(t.__name__ for t in expected_type)
     return expected_type.__name__
 
+def add_missing_settings(loaded: Dict, added: List[str]) -> None:
+    """Write settings that were missing from the config file back to it, with their defaults, so they show up
+    for editing. Existing values are left alone; the first rewrite keeps the old file as config.json.bak."""
+    to_write = dict(loaded)
+    for key in added:
+        to_write[key] = copy.deepcopy(DEFAULT_CONFIG[key])
+    try:
+        mode = os.stat(CONFIG_FILE).st_mode & 0o777
+        backup = CONFIG_FILE + ".bak"
+        if not os.path.exists(backup):
+            shutil.copy2(CONFIG_FILE, backup)
+        fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(to_write, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp_path, mode)   # the file holds passwords: keep its permissions
+        os.replace(tmp_path, CONFIG_FILE)
+        logger.info("Added %d missing setting(s) to %s: %s", len(added), CONFIG_FILE, ", ".join(added))
+    except Exception as e:
+        logger.warning("Could not add missing settings to %s (%s); using defaults for this run.", CONFIG_FILE, str(e))
+
 def load_config() -> Dict:
     if not os.path.exists(CONFIG_FILE):
         logger.info("Config file not found at %s. Creating default config.", CONFIG_FILE)
@@ -178,7 +203,11 @@ def load_config() -> Dict:
 
     try:
         with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
+            loaded = json.load(f)
+        config = dict(loaded)
+        missing = [key for key in DEFAULT_CONFIG if key not in config]
+        for key in missing:
+            config[key] = copy.deepcopy(DEFAULT_CONFIG[key])
         required_fields = {
             "ip_addresses": list,
             "username": str,
@@ -205,6 +234,7 @@ def load_config() -> Dict:
             "force_regenerate_thumbnails": bool,
             "timezone": str,
             "mode": str,
+            "download_method": str,
             "watch_cameras": list,
             "watch_seconds": (int, float),
             "onvif_username": str,
@@ -274,6 +304,9 @@ def load_config() -> Dict:
         if config["mode"] not in VALID_MODES:
             logger.error("'mode' in %s must be one of: %s.", CONFIG_FILE, ", ".join(VALID_MODES))
             sys.exit(1)
+        if config["download_method"] not in ("download", "playback"):
+            logger.error("'download_method' in %s must be 'download' or 'playback'.", CONFIG_FILE)
+            sys.exit(1)
         for cam in config["watch_cameras"]:
             if not (isinstance(cam, str) and re.fullmatch(r"cam[1-4]", cam.strip().lower())):
                 logger.error("'watch_cameras' in %s must list names like cam1..cam4.", CONFIG_FILE)
@@ -291,6 +324,8 @@ def load_config() -> Dict:
             logger.error("'hook_timeout_minutes' in %s must be a positive number.", CONFIG_FILE)
             sys.exit(1)
 
+        if missing:
+            add_missing_settings(loaded, missing)
         return config
     except FileNotFoundError:
         logger.error("%s not found.", CONFIG_FILE)
@@ -403,6 +438,7 @@ thumbnail_quality = config["thumbnail_quality"]
 max_retries = config["max_retries"]
 freshness_seconds = config["freshness_seconds"]
 run_mode = config["mode"]
+download_method = config["download_method"]
 watch_cameras = config["watch_cameras"]
 watch_seconds = config["watch_seconds"]
 onvif_username = config["onvif_username"] or username   # ONVIF listener: camera account
@@ -741,21 +777,27 @@ async def process_recording(
                 thumbnail_time_percentage=thumbnail_time_percentage,
                 thumbnail_quality=thumbnail_quality,
                 force_regenerate_thumbnails=force_regenerate_thumbnails,
-                overwriteFiles=config.get("overwrite_files", False)
+                overwriteFiles=config.get("overwrite_files", False),
+                download_method=download_method
             )
             last_logged = None
             async for status in downloader.download():
                 last_status = status
                 action = status["currentAction"]
-                if action == "Recording in progress":
-                    RUN_STATS["deferred"] += 1
+                if action in ("Recording in progress", "Camera busy"):
+                    RUN_STATS["deferred"] += 1   # try again on a later run
                     count("deferred")
                 # Log only when something changed, in whole seconds: one line per second of video at most.
                 progress, total = int(status["progress"]), int(status["total"])
                 if (action, progress) != last_logged:
                     last_logged = (action, progress)
                     name = os.path.basename(status.get("fileName") or filename)
-                    if total:
+                    if action == "Recording in progress":
+                        # pytapo only compares the end time in the camera's list with the clock: say by how much.
+                        ends_in = end_time + effective_time_correction - time.time()
+                        logger.info("Camera %s: Recording in progress %s (camera lists it ending in %d s, "
+                                    "time correction %s s)", ip_address, name, ends_in, effective_time_correction)
+                    elif total:
                         logger.info("Camera %s: %s %s: %d / %d s", ip_address, action, name, progress, total)
                     else:
                         logger.info("Camera %s: %s %s", ip_address, action, name)
@@ -767,6 +809,10 @@ async def process_recording(
                 logger.warning("Camera %s: Download of %s failed (attempt %d); will not retry for %d min",
                                ip_address, filename, failures,
                                CLIP_RETRY_DELAYS_S[min(failures, len(CLIP_RETRY_DELAYS_S)) - 1] // 60)
+            elif last_status and last_status["currentAction"] in ("Recording in progress", "Camera busy"):
+                pass   # already reported above; the clip is picked up on a later run
+            elif last_status and last_status["currentAction"] in ("Skipping", "Skipping (duration too short)"):
+                CONFIRMED_CLIPS.add(clip_id)   # already on disk, or too short to keep
             elif actual_file and os.path.exists(actual_file):
                 clear_clip_failure(clip_key)
                 CONFIRMED_CLIPS.add(clip_id)
@@ -1071,10 +1117,20 @@ async def main(only_cam: Optional[int] = None, dates: Optional[List[str]] = None
 
 # ── Daemon modes (sweep / hybrid / watch) ──────────────────────────────────────
 
-def recent_dates() -> List[str]:
-    """Today and yesterday in the config timezone (what a new recording can belong to)."""
+YESTERDAY_GRACE_MINUTES = 15   # watch mode keeps checking yesterday this long after local midnight
+
+
+def minutes_since_midnight() -> float:
+    now = datetime.now(timezone)
+    return now.hour * 60 + now.minute + now.second / 60
+
+
+def recent_dates(include_yesterday: bool = True) -> List[str]:
+    """Today, and optionally yesterday, in the config timezone. A new recording belongs to yesterday only
+    if it started before midnight, so a watch loop needs yesterday just around startup and midnight."""
     today = datetime.now(timezone).date()
-    return [(today - timedelta(days=d)).strftime("%Y%m%d") for d in range(min(2, max_days))]
+    days = 2 if include_yesterday else 1
+    return [(today - timedelta(days=d)).strftime("%Y%m%d") for d in range(min(days, max_days))]
 
 
 async def watch_camera(ip_address: str, camera_number: int, stop: threading.Event, full_scans: bool) -> None:
@@ -1083,22 +1139,30 @@ async def watch_camera(ip_address: str, camera_number: int, stop: threading.Even
     session: Dict = {}
     last_full = time.time()
     auth_failures = 0
+    first_cycle = True   # also set again after an outage, so yesterday is re-checked once
+    carry = False        # yesterday still had clips waiting on the last cycle
     logger.info("Camera %s: watching %s every %ds%s", camera_number, ip_address, watch_seconds,
                 f", full scan every {sweep_minutes} min" if full_scans else "")
     while not stop.is_set():
         full = full_scans and time.time() - last_full >= sweep_minutes * 60
+        # Yesterday only matters just after startup/an outage and just after midnight; a full scan covers anything older.
+        include_yesterday = first_cycle or carry or minutes_since_midnight() < YESTERDAY_GRACE_MINUTES
         try:
             result = await process_camera(ip_address, camera_number, base_download_dir, username, password,
-                                          time.time(), None if full else recent_dates(),
+                                          time.time(), None if full else recent_dates(include_yesterday),
                                           session=session, lock_wait=0)
-            if full and result is not None:
-                last_full = time.time()
+            if result is not None:
+                first_cycle = False
+                carry = include_yesterday and (RUN_COUNTS.get() or {}).get("deferred", 0) > 0
+                if full:
+                    last_full = time.time()
         except Exception as e:
             logger.error("Camera %s: Watch cycle failed: %s", camera_number, e)
         wait = float(watch_seconds)
         error = LOGIN_ERRORS.get(camera_number)
         if error:
             session.clear()
+            first_cycle = True
             suspended = SUSPENDED_RE.search(error)
             if suspended:
                 wait = int(suspended.group(1)) + 60
